@@ -17,6 +17,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from parser import (
@@ -32,6 +33,13 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Loopazon API",
     version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 _ALL_GENRES = sorted(get_genres().keys())
