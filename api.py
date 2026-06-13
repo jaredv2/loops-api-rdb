@@ -1,39 +1,30 @@
 """
-looperman_api.py
-----------------
-FastAPI wrapper around the Loopazon scraper/parser.
+Samplette API — FastAPI wrapper around the Samplette discovery API.
 
 Endpoints:
-    GET /challenge              – random loop with mp3, waveform, details
-    GET /download/{loop_id}     – proxy-download the MP3
+    GET /challenge                – random sample with full metadata
+    GET /sample/{video_id}        – single sample by video ID
+    GET /download/{video_id}      – YouTube URL for client-side playback
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import random
+import re
 import time
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-
-from parser import (
-    parse_listing_page,
-    parse_detail_page,
-    get_genres,
-    BASE_URL,
-)
+from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Loopazon API",
-    version="1.0.0",
-)
+app = FastAPI(title="Samplette API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,123 +33,225 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_ALL_GENRES = sorted(get_genres().keys())
+# ── Samplette config ──────────────────────────────────────────────────────────
 
-_SEARCH_URL = (
-    "https://www.loopazon.com/"
-    "?subcats=Y&pcode_from_q=Y&pshort=Y&pfull=Y&pname=Y"
-    "&pkeywords=Y&search_performed=Y&q={}&dispatch=products.search"
-)
+SAMPLETTE_BASE = "https://samplette.io"
+GET_SAMPLE_URL = f"{SAMPLETTE_BASE}/get_sample"
+
+# ── session state ─────────────────────────────────────────────────────────────
+
+_SEEN_IDS: list[int] = []
+_LAST_SEED_ID: Optional[int] = None
+
+# Reused HTTP client with session cookies + CSRF token
+_CLIENT: Optional[httpx.AsyncClient] = None
+_CSRF_TOKEN: Optional[str] = None
 
 
-# ── TTL cache ──────────────────────────────────────────────────────────────────
+async def _ensure_client() -> httpx.AsyncClient:
+    global _CLIENT, _CSRF_TOKEN
+    if _CLIENT is not None and _CSRF_TOKEN is not None:
+        return _CLIENT
+
+    client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    resp = await client.get(f"{SAMPLETTE_BASE}/", headers=headers)
+
+    # Extract CSRF token from meta tag
+    m = re.search(r'<meta\s+content="([^"]+)"\s+name="csrf-token"\s*>', resp.text)
+    if not m:
+        m = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"\s*>', resp.text)
+    if not m:
+        raise HTTPException(status_code=502, detail="Could not extract CSRF token from Samplette")
+
+    _CSRF_TOKEN = m.group(1)
+    _CLIENT = client
+    logger.info("Samplette session established: csrf_token=%.20s", _CSRF_TOKEN)
+    return _CLIENT
+
+
+# ── TTL cache ─────────────────────────────────────────────────────────────────
 
 _CACHE: dict[str, tuple[float, str]] = {}
 _CACHE_TTL = 300
 
 
-async def _fetch(url: str) -> str:
+async def _fetch_samplette(
+    count: int = 10,
+    video_id: Optional[int] = None,
+    kind: Optional[str] = None,
+    exclude: Optional[list[int]] = None,
+    previous_ids: Optional[list[int]] = None,
+    include_previously_seen: bool = False,
+    repeat_between_sessions: bool = False,
+) -> list[dict]:
+    client = await _ensure_client()
+
+    body: dict = {
+        "count": count,
+        "include-previously-seen": include_previously_seen,
+        "repeat-between-sessions": repeat_between_sessions,
+        "exclude": exclude or [],
+        "previous-ids": previous_ids or [],
+    }
+
+    if video_id is not None:
+        body["id"] = video_id
+        body["kind"] = kind or "direct"
+    else:
+        body["id"] = None
+        body["kind"] = "random"
+
+    # Build a cache key from the body
+    cache_key = f"samplette:{json.dumps(body, sort_keys=True)}"
     now = time.time()
-    cached = _CACHE.get(url)
+    cached = _CACHE.get(cache_key)
     if cached and (now - cached[0]) < _CACHE_TTL:
-        return cached[1]
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        resp = await client.get(url, headers={"User-Agent": "looperman-api/1.0.0"})
-        if resp.status_code == 404:
-            raise HTTPException(status_code=404, detail="Not found on Loopazon")
-        resp.raise_for_status()
-        text = resp.text
-    _CACHE[url] = (now, text)
-    return text
+        return json.loads(cached[1])
+
+    headers = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Accept": "*/*",
+        "Referer": f"{SAMPLETTE_BASE}/",
+        "Origin": SAMPLETTE_BASE,
+        "x-requested-with": "XMLHttpRequest",
+        "x-csrftoken": _CSRF_TOKEN,
+    }
+
+    logger.info("Samplette POST %s ids=%s", GET_SAMPLE_URL, body.get("previous-ids", [])[:3])
+
+    resp = await client.post(GET_SAMPLE_URL, headers=headers, json=body)
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Samplette returned {resp.status_code}: {resp.text[:200]}",
+        )
+
+    data = resp.json()
+    if not isinstance(data, list):
+        logger.warning("Samplette returned non-list: %s", str(data)[:200])
+        return []
+
+    _CACHE[cache_key] = (now, json.dumps(data))
+    return data
 
 
-async def _fetch_bytes(url: str) -> bytes:
-    async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-        resp = await client.get(url, headers={"User-Agent": "looperman-api/1.0.0"})
-        resp.raise_for_status()
-        return resp.content
+# ── YouTube helpers ───────────────────────────────────────────────────────────
+
+_YOUTUBE_RE = re.compile(r"[?&]v=([a-zA-Z0-9_-]{11})")
 
 
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-async def _find_loop(loop_id: int) -> Optional[dict]:
-    html = await _fetch(_SEARCH_URL.format(loop_id))
-    listing = parse_listing_page(html, genre="", page=1)
-    return next((l for l in listing.loops if l.get("id") == loop_id), None)
+def _extract_video_id(url: str) -> Optional[str]:
+    m = _YOUTUBE_RE.search(url)
+    return m.group(1) if m else None
 
 
-# ── endpoints ──────────────────────────────────────────────────────────────────
+# ── response normalizer ──────────────────────────────────────────────────────
+
+def _normalize(raw: dict) -> dict:
+    ab = raw.get("acousticbrainz") or {}
+    discogs = raw.get("discogs") or {}
+    artist_array = discogs.get("artist_array") or []
+    label_array = discogs.get("label_array") or []
+    genre_array = discogs.get("genre_array") or []
+    style_array = discogs.get("style_array") or []
+
+    youtube_url = raw.get("url", "")
+    video_id = _extract_video_id(youtube_url)
+
+    published = raw.get("published", "") or ""
+    if published and " " in published:
+        published = published.split(" ")[0]
+
+    return {
+        "id": raw.get("id"),
+        "title": raw.get("best_title") or raw.get("title", ""),
+        "full_title": raw.get("title", ""),
+        "youtube_url": youtube_url,
+        "youtube_video_id": video_id,
+        "channel": raw.get("channel", ""),
+        "channel_id": raw.get("channel_id", ""),
+        "duration": raw.get("duration"),
+        "views": raw.get("views"),
+        "published": published,
+        "bpm": ab.get("tempo"),
+        "key": ab.get("key"),
+        "scale": ab.get("scale"),
+        "tonality": ab.get("tonality"),
+        "original_artist": artist_array[0] if artist_array else None,
+        "original_title": discogs.get("title"),
+        "genre_tags": genre_array,
+        "style_tags": style_array,
+        "label": label_array[0] if label_array else None,
+        "country": discogs.get("country"),
+        "year": discogs.get("year"),
+        "cover_image": discogs.get("cover_image"),
+        "thumb": discogs.get("thumb"),
+        "discogs_url": discogs.get("uri"),
+    }
+
+
+# ── endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/challenge")
 async def get_challenge(
-    genre: Optional[str] = Query(None, description="Genre slug; random if omitted"),
-    enrich: bool = Query(False, description="Fetch detail page for live mp3/waveform"),
+    genre: Optional[str] = Query(None, description="Ignored — kept for API compatibility"),
+    enrich: bool = Query(False, description="No-op — Samplette already returns full metadata"),
 ):
-    chosen_genre = genre if genre else random.choice(_ALL_GENRES)
-    page = random.randint(1, 10)
-    url = f"{BASE_URL}/free-loops/genres-{chosen_genre}"
-    if page > 1:
-        url += f"/page-{page}"
-    try:
-        html = await _fetch(url)
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            url = f"{BASE_URL}/free-loops/genres-{chosen_genre}"
-            html = await _fetch(url)
-        else:
-            raise
-    listing = parse_listing_page(html, genre=chosen_genre, page=page)
-    if not listing.loops:
-        raise HTTPException(status_code=404, detail=f"No loops for genre '{chosen_genre}'.")
-    raw = random.choice(listing.loops)
+    global _LAST_SEED_ID, _SEEN_IDS
 
-    loop = {
-        "id": raw.get("id"),
-        "title": raw.get("title"),
-        "bpm": raw.get("bpm"),
-        "key": raw.get("key"),
-        "genre": raw.get("genre"),
-        "mp3_url": raw.get("mp3_url"),
-        "waveform_url": raw.get("waveform_url"),
-        "waveform_img_url": raw.get("waveform_img_url"),
-        "detail_url": raw.get("detail_url"),
-        "uploader": raw.get("uploader"),
-        "tags": raw.get("tags", []),
+    previous_ids = _SEEN_IDS[-20:] if _SEEN_IDS else None
+
+    kw: dict = {
+        "count": 10,
+        "include_previously_seen": False,
+        "repeat_between_sessions": False,
     }
+    if _LAST_SEED_ID is not None:
+        kw["video_id"] = _LAST_SEED_ID
+        kw["kind"] = "direct"
+    if previous_ids:
+        kw["previous_ids"] = previous_ids
 
-    if enrich and raw.get("detail_url"):
-        try:
-            html = await _fetch(raw["detail_url"])
-            data = parse_detail_page(html)
-            if data:
-                loop["mp3_url"] = data.get("mp3_url", "")
-                loop["waveform_url"] = data.get("waveform_url", "")
-                loop["waveform_img_url"] = data.get("waveform_img_url", "")
-                loop["tags"] = data.get("tags", [])
-                loop["description"] = data.get("description", "")
-        except Exception as exc:
-            logger.warning("Enrich failed: %s", exc)
+    results = await _fetch_samplette(**kw)
 
-    return loop
+    if not results:
+        kw.pop("video_id", None)
+        kw.pop("kind", None)
+        kw.pop("previous_ids", None)
+        results = await _fetch_samplette(**kw)
+        if not results:
+            raise HTTPException(status_code=404, detail="No samples available from Samplette.")
+
+    raw = random.choice(results)
+
+    _LAST_SEED_ID = raw.get("id")
+    _SEEN_IDS.append(raw.get("id"))
+    if len(_SEEN_IDS) > 100:
+        _SEEN_IDS[:] = _SEEN_IDS[-100:]
+
+    return _normalize(raw)
 
 
-@app.get("/download/{loop_id}")
-async def download_loop(loop_id: int):
-    match = await _find_loop(loop_id)
-    if not match or not match.get("mp3_url"):
-        raise HTTPException(status_code=404, detail=f"Loop {loop_id} not found.")
+@app.get("/sample/{video_id}")
+async def get_sample(video_id: int):
+    results = await _fetch_samplette(count=1, video_id=video_id, kind="direct")
+    if not results:
+        raise HTTPException(status_code=404, detail=f"Sample {video_id} not found.")
+    return _normalize(results[0])
 
-    content = await _fetch_bytes(match["mp3_url"])
-    filename = f"rundatbeat-sample.mp3"
 
-    return Response(
-        content=content,
-        media_type="audio/mpeg",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            "Content-Length": str(len(content)),
-            "X-Loop-Title": match.get("title", ""),
-            "X-Loop-BPM": str(match.get("bpm") or ""),
-            "X-Loop-Key": match.get("key") or "",
-        },
-    )
+@app.get("/download/{video_id}")
+async def download_sample(video_id: int):
+    results = await _fetch_samplette(count=1, video_id=video_id, kind="direct")
+    if not results:
+        raise HTTPException(status_code=404, detail=f"Sample {video_id} not found.")
+
+    raw = results[0]
+    youtube_url = raw.get("url", "")
+    vid = _extract_video_id(youtube_url)
+
+    return JSONResponse(content={
+        "youtube_url": youtube_url,
+        "video_id": vid,
+    })
