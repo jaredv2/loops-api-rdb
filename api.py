@@ -9,6 +9,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import random
@@ -16,7 +17,7 @@ import re
 import time
 from typing import Optional
 
-import httpx
+import cloudscraper
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -43,21 +44,23 @@ GET_SAMPLE_URL = f"{SAMPLETTE_BASE}/get_sample"
 _SEEN_IDS: list[int] = []
 _LAST_SEED_ID: Optional[int] = None
 
-# Reused HTTP client with session cookies + CSRF token
-_CLIENT: Optional[httpx.AsyncClient] = None
+# Reused cloudscraper session (bypasses Cloudflare JS challenge)
+_SCRAPER: Optional[cloudscraper.CloudScraper] = None
 _CSRF_TOKEN: Optional[str] = None
 
 
-async def _ensure_client() -> httpx.AsyncClient:
-    global _CLIENT, _CSRF_TOKEN
-    if _CLIENT is not None and _CSRF_TOKEN is not None:
-        return _CLIENT
+async def _ensure_session() -> cloudscraper.CloudScraper:
+    global _SCRAPER, _CSRF_TOKEN
+    if _SCRAPER is not None and _CSRF_TOKEN is not None:
+        return _SCRAPER
 
-    client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    resp = await client.get(f"{SAMPLETTE_BASE}/", headers=headers)
+    scraper = cloudscraper.create_scraper()
+    scraper.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    })
 
-    # Extract CSRF token from meta tag
+    resp = await asyncio.to_thread(scraper.get, f"{SAMPLETTE_BASE}/")
+
     m = re.search(r'<meta\s+content="([^"]+)"\s+name="csrf-token"\s*>', resp.text)
     if not m:
         m = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"\s*>', resp.text)
@@ -65,9 +68,9 @@ async def _ensure_client() -> httpx.AsyncClient:
         raise HTTPException(status_code=502, detail="Could not extract CSRF token from Samplette")
 
     _CSRF_TOKEN = m.group(1)
-    _CLIENT = client
+    _SCRAPER = scraper
     logger.info("Samplette session established: csrf_token=%.20s", _CSRF_TOKEN)
-    return _CLIENT
+    return _SCRAPER
 
 
 # ── TTL cache ─────────────────────────────────────────────────────────────────
@@ -85,7 +88,7 @@ async def _fetch_samplette(
     include_previously_seen: bool = False,
     repeat_between_sessions: bool = False,
 ) -> list[dict]:
-    client = await _ensure_client()
+    scraper = await _ensure_session()
 
     body: dict = {
         "count": count,
@@ -102,7 +105,6 @@ async def _fetch_samplette(
         body["id"] = None
         body["kind"] = "random"
 
-    # Build a cache key from the body
     cache_key = f"samplette:{json.dumps(body, sort_keys=True)}"
     now = time.time()
     cached = _CACHE.get(cache_key)
@@ -120,7 +122,7 @@ async def _fetch_samplette(
 
     logger.info("Samplette POST %s ids=%s", GET_SAMPLE_URL, body.get("previous-ids", [])[:3])
 
-    resp = await client.post(GET_SAMPLE_URL, headers=headers, json=body)
+    resp = await asyncio.to_thread(scraper.post, GET_SAMPLE_URL, json=body, headers=headers)
     if resp.status_code != 200:
         raise HTTPException(
             status_code=502,
